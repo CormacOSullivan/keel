@@ -1582,7 +1582,7 @@ function ordinal(n) { const s = ['th', 'st', 'nd', 'rd'], v = n % 100; return n 
 function repeatLabel(r) { return r.day >= 31 ? 'Monthly on the last day' : `Monthly on the ${ordinal(r.day)}`; }
 function recurringTx(r, date, i) {
   return {
-    id: uid('t'), date, postDate: date, description: r.name, merchant: r.name, merchantKey: merchantKey(r.name), amount: r.amount,
+    id: uid('t'), date, postDate: date, description: r.name, merchant: r.name, merchantKey: r.matchKey || merchantKey(r.name), amount: r.amount,
     categoryId: r.categoryId, catSource: 'manual', accountId: r.accountId || '', notes: r.notes || '', tags: [], goalId: '', excluded: false,
     source: 'recurring', recurringId: r.id, createdAt: Date.now() + (i || 0)
   };
@@ -2443,7 +2443,7 @@ function reviewHTML(d) {
       ${['generic', 'csv', 'text'].includes(d.meta.mode) ? `<div class="banner" style="margin-top:12px;cursor:default">${ic('alert')}<span class="grow small">Check that purchases show as money out. If they're the wrong way round, <button class="link small" data-act="draft-flip">flip all signs</button>.</span></div>` : ''}
     </section>
     <div class="row between wrap small">
-      <span class="muted">${c.inc} to import, ${money(spent)} of spending${c.dup ? `, ${c.dup} already recorded (skipped)` : ''}</span>
+      <span class="muted">${c.inc} to import, ${money(spent)} of spending${c.dup ? `, ${c.dup} already recorded (skipped)` : ''}${d.rows.some((r) => r.include && r.replaces) ? `, ${d.rows.filter((r) => r.include && r.replaces).length} replacing automatic copies` : ''}</span>
       <span class="row" style="gap:4px"><button class="link small" data-act="draft-all" data-v="1">Include all</button><span class="faint">/</span><button class="link small" data-act="draft-all" data-v="0">none</button></span>
     </div>
     <div class="chips">${chip('all', 'All', c.all)}${c.uncat ? chip('uncat', 'Needs category', c.uncat) : ''}${c.dup ? chip('dup', 'Already recorded', c.dup) : ''}${chip('out', 'Money out', c.out)}${c.inflow ? chip('in', 'Money in', c.inflow) : ''}</div>
@@ -2464,7 +2464,7 @@ function reviewRow(r) {
       <div class="row between" style="gap:8px;align-items:baseline"><span class="strong" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.merchant)}</span>${amountHTML(r)}</div>
       <div class="tiny faint" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${fmtDate(r.date)}, ${esc(r.description)}${r.foreign ? `, ${esc(r.foreign)}` : ''}</div>
       <div class="row wrap" style="gap:6px"><button class="catpill ${none ? 'none' : ''}" data-act="draft-cat" data-tid="${r.tid}"><span>${c.emoji}</span><span>${none ? 'Choose category' : esc(c.name)}</span></button>
-      ${src ? `<span class="tag acc" style="margin-top:5px">${src}</span>` : ''}${r.dup ? `<span class="tag warn" style="margin-top:5px">${r.dupReason === 'repeat' ? 'Matches a repeating payment' : 'Already imported'}</span>` : ''}</div>
+      ${src ? `<span class="tag acc" style="margin-top:5px">${src}</span>` : ''}${r.dup ? '<span class="tag warn" style="margin-top:5px">Already imported</span>' : ''}${r.replaces && r.include ? `<span class="tag acc" style="margin-top:5px">Replaces the automatic ${esc(r.replacesName)}</span>` : ''}</div>
     </div></div>`;
 }
 
@@ -2643,7 +2643,8 @@ function drawTxSheet(e) {
   const c = cat(f.categoryId);
   const others = f.merchantKey ? S.transactions.filter((t) => t.id !== f.id && t.merchantKey === f.merchantKey && t.categoryId !== f.categoryId).length : 0;
   const goals = S.goals.filter((g) => !g.archived || g.id === f.goalId);
-  const canRepeat = !orig || (!orig.recurringId && orig.source === 'manual');
+  const canRepeat = !orig || !orig.recurringId;
+  const importedTx = !!orig && orig.source !== 'manual' && orig.source !== 'recurring';
   const rec = orig && orig.recurringId ? S.recurring.find((r) => r.id === orig.recurringId) : null;
   const accOpts = `<option value="">No account</option>` + S.accounts.map((a) => `<option value="${a.id}" ${f.accountId === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('');
   setSheetBody(e, `
@@ -2656,7 +2657,7 @@ function drawTxSheet(e) {
       <label class="field">Name<input class="input" data-field="merchant" value="${esc(f.merchant)}" placeholder="Where or what was it?" autocomplete="off"></label>
       ${orig && orig.description && orig.description !== orig.merchant ? `<div class="tiny faint" style="margin-top:-8px">On statement: ${esc(orig.description)}${orig.foreign ? `, ${esc(orig.foreign)}` : ''}</div>` : ''}
       <div class="grid2">
-        <label class="field">Date<input class="input" type="date" data-field="date" data-change="tx-date" value="${esc(f.date)}"></label>
+        <label class="field">Date${st.rep.on ? ' of the first one' : ''}<input class="input" type="date" data-field="date" data-change="tx-date" value="${esc(f.date)}"></label>
         <label class="field">Account<select class="input" data-field="accountId">${accOpts}</select></label>
       </div>
       <div class="field"><span class="small strong muted">Category</span>
@@ -2664,17 +2665,20 @@ function drawTxSheet(e) {
       ${st.catChanged && f.merchantKey && c.id !== 'uncategorized' ? `<div class="panel" style="padding:8px 14px;background:var(--surface-2)">
         <label class="toggle"><input type="checkbox" data-field="remember" ${st.remember ? 'checked' : ''}>Always use ${esc(c.name)} for ${esc(displayName(f.merchantKey))}</label>
         ${others ? `<label class="toggle"><input type="checkbox" data-field="applyAll" ${st.applyAll ? 'checked' : ''}>Also change ${others} other ${esc(displayName(f.merchantKey))} transaction${others === 1 ? '' : 's'}</label>` : ''}</div>` : ''}
-      ${goals.length && st.kind === 'expense' ? `<label class="field">Paid from savings goal<select class="input" data-field="goalId"><option value="">None</option>${goals.map((g) => `<option value="${g.id}" ${f.goalId === g.id ? 'selected' : ''}>${g.emoji} ${esc(g.name)}</option>`).join('')}</select></label>` : ''}
-      <label class="field">Notes<textarea class="input" data-field="notes" placeholder="Optional">${esc(f.notes || '')}</textarea></label>
-      <label class="field">Tags<input class="input" data-field="tags" value="${esc((f.tags || []).join(', '))}" placeholder="e.g. work, holiday (comma separated)"></label>
-      <label class="toggle"><input type="checkbox" data-field="excluded" ${f.excluded ? 'checked' : ''}>Leave out of reports and budgets</label>
       ${rec ? `<div class="panel" style="padding:10px 14px;background:var(--surface-2)"><div class="row between"><span class="small"><b>${esc(repeatLabel(rec))}</b>${repeatActive(rec) ? `, next on ${fmtDate(rec.nextDate)}` : ', stopped'}. Changes here only affect this one.</span><button class="link small" data-act="rec-edit" data-id="${rec.id}">Edit repeat</button></div></div>` : ''}
       ${canRepeat ? `<div class="panel" style="padding:6px 14px;background:var(--surface-2)">
         <label class="toggle"><input type="checkbox" data-field="repOn" data-change="tx-rep" ${st.rep.on ? 'checked' : ''}><b>Repeat every month</b></label>
         ${st.rep.on ? `<div class="grid2" style="padding-bottom:10px">
           <label class="field">On day<select class="input" data-field="repDay" data-change="tx-repday">${Array.from({ length: 31 }, (_, i) => `<option value="${i + 1}" ${st.rep.day === i + 1 ? 'selected' : ''}>${i === 30 ? '31 (last day)' : ordinal(i + 1)}</option>`).join('')}</select></label>
           <label class="field">Until (optional)<input class="input" type="date" data-field="repUntil" value="${esc(st.rep.until)}"></label></div>
-          <p class="tiny muted" style="margin:0 0 8px">A copy is added automatically on that day each month. If the date above is in an earlier month, the months since then are filled in too.</p>` : ''}</div>` : ''}
+          <p class="tiny muted" style="margin:0 0 8px">${importedTx
+            ? 'From next time it\'s due, a copy is added automatically on that day each month. When the real charge arrives on a later statement, it replaces the copy, so the exact amount is kept and nothing is counted twice.'
+            : 'A copy is added automatically on that day each month. If the date above is in an earlier month, the months since then are filled in too.'}</p>` : ''}</div>` : ''}
+      ${goals.length && st.kind === 'expense' ? `<label class="field">Paid from savings goal<select class="input" data-field="goalId"><option value="">None</option>${goals.map((g) => `<option value="${g.id}" ${f.goalId === g.id ? 'selected' : ''}>${g.emoji} ${esc(g.name)}</option>`).join('')}</select></label>` : ''}
+      <label class="field">Notes<textarea class="input" data-field="notes" placeholder="Optional">${esc(f.notes || '')}</textarea></label>
+      <label class="field">Tags<input class="input" data-field="tags" value="${esc((f.tags || []).join(', '))}" placeholder="e.g. work, holiday (comma separated)"></label>
+      <label class="toggle"><input type="checkbox" data-field="excluded" ${f.excluded ? 'checked' : ''}>Leave out of reports and budgets</label>
+
       ${orig ? `<div class="row wrap"><button class="btn sm" data-act="tx-split">${ic('split')}Split into categories</button>${f.merchantKey ? `<button class="btn sm" data-act="search-merchant" data-key="${esc(f.merchantKey)}">${ic('search')}All from this merchant</button>` : ''}</div>` : ''}
     </div>`);
 }
@@ -2710,10 +2714,20 @@ function saveTxSheet() {
     }
   }
   let repMsg = '';
-  if (st.rep.on && !t.recurringId && (!orig || orig.source === 'manual')) {
+  if (st.rep.on && !t.recurringId) {
     const day = clamp(st.rep.dayTouched ? (+st.rep.day || 1) : (+String(t.date).slice(8, 10) || 1), 1, 31);
-    const r = { id: uid('rp'), name: t.merchant, amount: t.amount, categoryId: t.categoryId, accountId: t.accountId || '', notes: t.notes || '', day,
-      startDate: t.date, endDate: st.rep.until || '', lastDate: t.date, nextDate: occurrence(nextYm(ymOf(t.date)), day), paused: false, createdAt: Date.now() };
+    const imported = !!orig && orig.source !== 'manual' && orig.source !== 'recurring';
+    let next = occurrence(nextYm(ymOf(t.date)), day);
+    if (imported) {
+      // statements bring in past charges themselves, so only start from the next one that's due
+      const latest = S.transactions.filter((x) => x.merchantKey === t.merchantKey && (x.amount < 0) === (t.amount < 0)).reduce((m, x) => (x.date > m ? x.date : m), t.date);
+      let base = addDays(todayISO(), 1);
+      if (addDays(latest, 1) > base) base = addDays(latest, 1);
+      next = firstOccurrenceFrom(day, base);
+      if (ymOf(next) <= ymOf(latest)) next = occurrence(nextYm(ymOf(latest)), day);
+    }
+    const r = { id: uid('rp'), name: t.merchant, matchKey: t.merchantKey || merchantKey(t.merchant), amount: t.amount, categoryId: t.categoryId, accountId: t.accountId || '', notes: t.notes || '', day,
+      startDate: t.date, endDate: st.rep.until || '', lastDate: t.date, nextDate: next, paused: false, createdAt: Date.now() };
     S.recurring.push(r); t.recurringId = r.id;
     const n = runRecurring();
     repMsg = n ? `. Repeats monthly; ${n} earlier month${n === 1 ? '' : 's'} added too` : `. Repeats monthly, next on ${fmtDate(r.nextDate)}`;
@@ -2919,6 +2933,10 @@ function sheetGoalMoney(id, mode = 'add') {
         <div class="grid2"><label class="field">Date<input class="input" type="date" id="gm-date" value="${todayISO()}"></label>
         <label class="field">Note<input class="input" id="gm-note" placeholder="Optional"></label>
         ${S.accounts.length ? `<label class="field">From account<select class="input" id="gm-acct"><option value="">No account</option>${S.accounts.map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select></label>` : ''}</div>
+        ${(() => { const r = goalRepeat(id); return r
+          ? `<p class="small muted" style="margin:0">This goal already gets ${money(-r.amount, { cents: false })} automatically, ${esc(repeatLabel(r).toLowerCase())}. <button class="link small" data-act="rec-edit" data-id="${r.id}">Change</button></p>`
+          : `<div class="panel" style="padding:6px 14px;background:var(--surface-2)"><label class="toggle"><input type="checkbox" id="gm-rep" data-change="gm-rep"><b>Repeat every month</b></label>
+            <div id="gm-rep-opts" style="display:none;padding-bottom:10px"><label class="field">On day<select class="input" id="gm-day">${Array.from({ length: 31 }, (_, i) => `<option value="${i + 1}" ${i + 1 === +todayISO().slice(8, 10) ? 'selected' : ''}>${i === 30 ? '31 (last day)' : ordinal(i + 1)}</option>`).join('')}</select></label></div></div>`; })()}
         <p class="small muted" style="margin:0">Current balance: ${money(goalBalance(g))}. Adding counts as money out (Saved) this month; taking out counts as money back in.</p>
       </div>`,
     foot: `<button class="btn primary grow" data-act="gm-save">${mode === 'add' ? 'Add to goal' : 'Take out of goal'}</button>`
@@ -3142,7 +3160,7 @@ function sheetHelp() {
       <h3>Savings are money out</h3>
       <p>Moving money into a goal counts as money out, shown as "Saved" next to "Spent", so your spending charts and budgets stay honest. Left over is money in, minus spent, minus saved. Each goal is also a category under Savings, so a bank transfer to savings can be filed straight into the right goal.</p>
       <h3>Repeating payments</h3>
-      <p>Tick "Repeat every month" when adding a transaction (rent, phone bill, pay, a savings transfer) and a copy is added automatically each month on the day you choose. Goals can add their monthly amount automatically too. Manage them all in Settings, Repeating payments. When you import a statement, lines that match a repeating payment are flagged so nothing is counted twice.</p>
+      <p>Tick "Repeat every month" when adding a transaction (rent, phone bill, pay, a savings transfer) and a copy is added automatically each month on the day you choose. Goals can add their monthly amount automatically too. Manage them all in Settings, Repeating payments. This works for imported transactions too: open one and tick "Repeat every month". When the real charge turns up on a later statement, it replaces the automatic copy, so the exact amount is kept and nothing is counted twice.</p>
       <h3>Card payments &amp; transfers</h3>
       <p>Paying off your credit card isn't spending (the purchases already were), so payments are filed under "Card payments &amp; transfers" and left out of your totals.</p>
       <h3>Your data</h3>
@@ -3171,12 +3189,18 @@ function markDuplicates(d) {
     const n = counts.get(k) || 0;
     if (n > 0) { r.dup = true; r.include = false; counts.set(k, n - 1); }
   }
-  // statement lines that match something already added by a repeating payment (same amount, within 3 days)
-  const used = new Set();
+  // a statement line that matches an automatic copy from a repeating payment replaces that copy
+  // (same merchant within 6 days, or same amount within 3 days) so the real amount wins and nothing doubles up
+  const used = new Set(UI.drafts.flatMap((x) => x.rows.map((y) => y.replaces).filter(Boolean)));
   for (const r of d.rows) {
     if (r.dup) continue;
-    const m = S.transactions.find((t) => t.source === 'recurring' && !used.has(t.id) && Math.abs(t.amount - r.amount) < 0.005 && Math.abs(daysBetween(t.date, r.date)) <= 3);
-    if (m) { used.add(m.id); r.dup = true; r.dupReason = 'repeat'; r.include = false; }
+    const m = S.transactions.find((t) => t.source === 'recurring' && !used.has(t.id) && (t.amount < 0) === (r.amount < 0) && (
+      (Math.abs(t.amount - r.amount) < 0.005 && Math.abs(daysBetween(t.date, r.date)) <= 3) ||
+      (t.merchantKey && t.merchantKey === r.key && Math.abs(daysBetween(t.date, r.date)) <= 6)));
+    if (m) {
+      used.add(m.id); r.replaces = m.id; r.replacesName = m.merchant; r.recurringId = m.recurringId;
+      if (!['rule', 'manual'].includes(r.catSource) && catUsable(m.categoryId)) { r.categoryId = m.categoryId; r.catSource = 'manual'; }
+    }
   }
 }
 function makeDraft(res, fileName, source) {
@@ -3337,17 +3361,20 @@ function commitDraft() {
   const importId = uid('i');
   const rows = d.rows.filter((r) => r.include);
   const now = Date.now();
+  const replaceIds = new Set(rows.map((r) => r.replaces).filter(Boolean));
+  const replaced = S.transactions.filter((t) => replaceIds.has(t.id));
+  if (replaced.length) S.transactions = S.transactions.filter((t) => !replaceIds.has(t.id));
   rows.forEach((r, i) => S.transactions.push({
     id: uid('t'), date: r.date, postDate: r.postDate, description: r.description, merchant: r.merchant, merchantKey: r.key, amount: r.amount,
-    categoryId: r.categoryId, catSource: r.catSource, bankCategory: r.bankCategory, foreign: r.foreign, accountId, importId, source: d.source,
+    categoryId: r.categoryId, catSource: r.catSource, bankCategory: r.bankCategory, foreign: r.foreign, accountId, importId, source: d.source, recurringId: r.recurringId || undefined,
     notes: '', tags: [], goalId: '', excluded: false, createdAt: now + i
   }));
-  S.imports.unshift({ id: importId, fileName: d.fileName, at: now, count: rows.length, accountId, periodStart: d.meta.periodStart || (rows[0] && rows[0].date), periodEnd: d.meta.periodEnd || (rows.length && rows[rows.length - 1].date), bank: d.meta.bank });
+  S.imports.unshift({ id: importId, replaced, fileName: d.fileName, at: now, count: rows.length, accountId, periodStart: d.meta.periodStart || (rows[0] && rows[0].date), periodEnd: d.meta.periodEnd || (rows.length && rows[rows.length - 1].date), bank: d.meta.bank });
   persist();
   UI.drafts.shift(); UI.draftFilter = 'all';
   const latest = rows.map((r) => r.date).sort().pop();
   if (latest) UI.period = periodOf(latest);
-  toast(`Imported ${rows.length} transaction${rows.length === 1 ? '' : 's'}`, { action: 'Undo', fn: () => { S.transactions = S.transactions.filter((t) => t.importId !== importId); S.imports = S.imports.filter((x) => x.id !== importId); persist(); render(); } });
+  toast(`Imported ${rows.length} transaction${rows.length === 1 ? '' : 's'}${replaced.length ? `, replacing ${replaced.length} automatic cop${replaced.length === 1 ? 'y' : 'ies'}` : ''}`, { action: 'Undo', fn: () => { S.transactions = S.transactions.filter((t) => t.importId !== importId).concat(replaced); S.imports = S.imports.filter((x) => x.id !== importId); persist(); render(); } });
   if (UI.drafts.length) { render(); window.scrollTo(0, 0); } else go('home');
 }
 function draftRow(tid) { const d = UI.drafts[0]; return d && d.rows.find((r) => r.tid === tid); }
@@ -3598,6 +3625,7 @@ const ACTIONS = {
     const n = S.transactions.filter((t) => t.importId === im.id).length;
     if (!(await confirmSheet({ title: 'Remove this import?', message: `This deletes the ${n} transactions imported from ${esc(im.fileName)}. You can import the file again later.`, confirm: 'Remove', danger: true }))) return;
     S.transactions = S.transactions.filter((t) => t.importId !== im.id);
+    if (im.replaced && im.replaced.length) { S.transactions.push(...im.replaced); im.replaced = []; }
     persist(); render(); refreshSheets(); toast(`Removed ${n} transactions`);
   },
   // budgets
@@ -3655,10 +3683,22 @@ const ACTIONS = {
     const g = goal(id);
     const note = $('#gm-note', e.el).value.trim();
     const name = note || (mode === 'add' ? `${g.name} savings` : `From ${g.name}`);
-    S.transactions.push({ id: uid('t'), date, postDate: date, description: name, merchant: name, merchantKey: merchantKey(name), amount: round2(mode === 'add' ? -v : v),
-      categoryId: 'goal:' + id, catSource: 'manual', accountId: ($('#gm-acct', e.el) || {}).value || '', notes: '', tags: [], goalId: '', excluded: false, source: 'manual', createdAt: Date.now() });
+    const tx = { id: uid('t'), date, postDate: date, description: name, merchant: name, merchantKey: merchantKey(name), amount: round2(mode === 'add' ? -v : v),
+      categoryId: 'goal:' + id, catSource: 'manual', accountId: ($('#gm-acct', e.el) || {}).value || '', notes: '', tags: [], goalId: '', excluded: false, source: 'manual', createdAt: Date.now() };
+    S.transactions.push(tx);
+    let repMsg = '';
+    const repBox = $('#gm-rep', e.el);
+    if (repBox && repBox.checked) {
+      const day = clamp(+$('#gm-day', e.el).value || 1, 1, 31);
+      const r = { id: uid('rp'), goalId: mode === 'add' ? id : undefined, name, matchKey: tx.merchantKey, amount: tx.amount, categoryId: 'goal:' + id, accountId: tx.accountId, notes: '', day,
+        startDate: date, endDate: '', lastDate: date, nextDate: occurrence(nextYm(ymOf(date)), day), paused: false, createdAt: Date.now() };
+      S.recurring.push(r); tx.recurringId = r.id;
+      if (mode === 'add' && !(g.monthly > 0)) g.monthly = round2(v);
+      const n = runRecurring();
+      repMsg = n ? `. Repeats monthly; ${n} earlier month${n === 1 ? '' : 's'} added too` : `. Repeats monthly, next on ${fmtDate(r.nextDate)}`;
+    }
     persist(); closeSheet(); render(); refreshSheets();
-    toast(mode === 'add' ? `Added ${money(v)} to ${g.name}` : `Took ${money(v)} out of ${g.name}`);
+    toast((mode === 'add' ? `Added ${money(v)} to ${g.name}` : `Took ${money(v)} out of ${g.name}`) + repMsg);
   },
   'goal-entry-del': (el) => {
     const idx = S.goalEntries.findIndex((x) => x.id === el.dataset.id); if (idx < 0) return;
@@ -3761,6 +3801,7 @@ const ACTIONS = {
 };
 
 const CHANGES = {
+  'gm-rep': (el) => { const o = $('#gm-rep-opts', topSheet().el); if (o) o.style.display = el.checked ? '' : 'none'; },
   'tx-rep': () => { const e = topSheet(); if (e && e.data.tx) { syncTxFields(e); const { f, st } = e.data.tx; if (!st.rep.dayTouched) st.rep.day = +String(f.date).slice(8, 10) || 1; drawTxSheet(e); } },
   'tx-date': () => { const e = topSheet(); if (e && e.data.tx) { syncTxFields(e); const { f, st } = e.data.tx; if (st.rep.on && !st.rep.dayTouched) { st.rep.day = +String(f.date).slice(8, 10) || 1; drawTxSheet(e); } } },
   'tx-repday': () => { const e = topSheet(); if (e && e.data.tx) e.data.tx.st.rep.dayTouched = true; },
