@@ -533,6 +533,9 @@ button.brow:hover { background: var(--surface-2); }
 .avatar > svg { width: 20px; height: 20px; color: var(--ink-2); }
 .item .good > svg { width: 20px; height: 20px; display: block; }
 
+.item.sched { opacity: .72; }
+.meter > i.sched { opacity: .38; border-radius: 0 99px 99px 0; }
+
 </style>
 </head>
 <body>
@@ -1071,7 +1074,7 @@ const GOAL_TEMPLATES = [['Travel', '✈️'], ['Clothes', '👕'], ['Trips', '�
 function defaultState() {
   return {
     app: 'keel-budget', version: 2,
-    settings: { currency: 'CAD', theme: 'auto', monthStartDay: 1, expectedIncome: 0, dateOrder: 'MDY', lastBackupAt: null, onboarded: false, createdAt: Date.now() },
+    settings: { repeatAhead: 12, currency: 'CAD', theme: 'auto', monthStartDay: 1, expectedIncome: 0, dateOrder: 'MDY', lastBackupAt: null, onboarded: false, createdAt: Date.now() },
     accounts: [],
     categories: DEFAULT_CATEGORIES.map((c) => ({ ...c })),
     transactions: [],
@@ -1091,6 +1094,11 @@ function normalizeState(raw) {
   s.settings = Object.assign({}, d.settings, (raw && raw.settings) || {});
   for (const k of ['accounts', 'categories', 'transactions', 'rules', 'goals', 'goalEntries', 'imports', 'recurring', 'groups']) if (!Array.isArray(s[k])) s[k] = d[k];
   if (!s.groupMap || typeof s.groupMap !== 'object') s.groupMap = { ...DEFAULT_GROUP_MAP };
+  if (s.settings.repeatAhead == null) s.settings.repeatAhead = 12;
+  for (const r of s.recurring) {
+    if (!Array.isArray(r.skips)) r.skips = [];
+    if (r.anchorMonth === undefined) { const a = s.transactions.find((t) => t.recurringId === r.id && t.source !== 'recurring'); r.anchorMonth = a ? a.date.slice(0, 7) : null; }
+  }
   if (!s.budgets || typeof s.budgets !== 'object') s.budgets = {};
   // make sure system categories exist
   for (const c of DEFAULT_CATEGORIES) if (['uncategorized', 'transfer', 'savingsxfer'].includes(c.id) && !s.categories.find((x) => x.id === c.id)) s.categories.push({ ...c });
@@ -1382,29 +1390,31 @@ function dataPeriods() { return [...new Set(S.transactions.map((t) => periodOf(t
 function firstDataDate() { let m = null; for (const t of S.transactions) if (!m || t.date < m) m = t.date; return m; }
 function coveredPeriod(key) { const f = firstDataDate(); return !!f && f <= addDays(periodRange(key).start, 4); }
 function hasData(key) { const r = periodRange(key); return S.transactions.some((t) => t.date >= r.start && t.date <= r.end); }
+const isScheduled = (t) => t.date > todayISO();
 function defaultPeriod() {
   const cur = periodOf(todayISO());
   if (!S.transactions.length || hasData(cur)) return cur;
-  const ps = dataPeriods();
+  const ps = dataPeriods().filter((p) => p <= cur);
   return ps[ps.length - 1] || cur;
 }
 function budgetTotal() { return round2(sum(Object.entries(S.budgets).filter(([id, v]) => v > 0 && catUsable(id)), ([, v]) => v)); }
-function budgetSpent(range) {
-  const txs = txBetween(range.start, range.end);
+function budgetSpent(range, only) {
+  const today = todayISO();
+  const txs = txBetween(range.start, range.end).filter((t) => !only || (only === 'scheduled' ? t.date > today : t.date <= today));
   const m = {};
   for (const c of spendByCat(txs, { skipGoalFunded: true })) m[c.id] = c.value;
   return m;
 }
 // money into a goal: its savings category (money out of your account), or spending paid from the goal
 function goalContribution(t) { return String(t.categoryId).startsWith('goal:') || kindOf(t.categoryId) === 'transfer' ? -t.amount : t.amount; }
-function goalTxs(g) { return S.transactions.filter((t) => !t.excluded && (t.categoryId === 'goal:' + g.id || t.goalId === g.id)); }
+function goalTxs(g, withScheduled) { const today = todayISO(); return S.transactions.filter((t) => !t.excluded && (t.categoryId === 'goal:' + g.id || t.goalId === g.id) && (withScheduled || t.date <= today)); }
 function goalBalance(g) {
   return round2(sum(S.goalEntries.filter((e) => e.goalId === g.id), (e) => e.amount) + sum(goalTxs(g), goalContribution));
 }
 function goalSavedIn(g, start, end) { return round2(sum(goalTxs(g).filter((t) => t.date >= start && t.date <= end && t.categoryId === 'goal:' + g.id && t.amount < 0), (t) => -t.amount)); }
 function goalHistory(g) {
   const items = S.goalEntries.filter((e) => e.goalId === g.id).map((e) => ({ id: e.id, date: e.date, amount: e.amount, note: e.note, type: 'entry' }))
-    .concat(goalTxs(g).map((t) => ({ id: t.id, date: t.date, amount: goalContribution(t), note: t.categoryId === 'goal:' + g.id ? (t.merchant || 'Moved to savings') : `Paid for ${t.merchant}`, type: 'tx', recurring: !!t.recurringId })));
+    .concat(goalTxs(g, true).map((t) => ({ id: t.id, date: t.date, amount: goalContribution(t), note: t.categoryId === 'goal:' + g.id ? (t.merchant || 'Moved to savings') : `Paid for ${t.merchant}`, type: 'tx', recurring: !!t.recurringId, scheduled: isScheduled(t) })));
   return items.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
 }
 function goalMonthlyNeeded(g, bal) {
@@ -1416,8 +1426,9 @@ function goalMonthlyNeeded(g, bal) {
 }
 function detectRecurring() {
   const map = new Map();
+  const today = todayISO();
   for (const t of S.transactions) {
-    if (t.excluded || t.amount >= 0 || kindOf(t.categoryId) !== 'expense') continue;
+    if (t.excluded || t.amount >= 0 || kindOf(t.categoryId) !== 'expense' || t.date > today) continue;
     const k = t.merchantKey || merchantKey(t.description);
     if (!map.has(k)) map.set(k, []);
     map.get(k).push(t);
@@ -1448,7 +1459,8 @@ function detectRecurring() {
 function insightsFor(key) {
   const out = [];
   const r = periodRange(key);
-  const txs = txBetween(r.start, r.end);
+  if (r.start > todayISO()) return out;
+  const txs = txBetween(r.start, r.end).filter((x) => !isScheduled(x));
   if (!txs.length) return out;
   const t = totals(txs);
   const cats = spendByCat(txs);
@@ -1495,7 +1507,7 @@ function insightsFor(key) {
   return out.slice(0, 5);
 }
 function suggestBudgets() {
-  const all = dataPeriods();
+  const all = dataPeriods().filter((p) => periodRange(p).start <= todayISO());
   const full = all.filter((p) => coveredPeriod(p) && (p !== periodOf(todayISO()) || all.length === 1));
   const ps = (full.length ? full : all).slice(-3);
   if (!ps.length) return {};
@@ -1624,23 +1636,54 @@ function recurringTx(r, date, i) {
   };
 }
 function repeatActive(r) { return !r.paused && r.nextDate && (!r.endDate || r.nextDate <= r.endDate); }
+// copies are filled in ahead of time (scheduled) up to the end of the month N months from now
+function repeatHorizon() {
+  const today = todayISO(); const ahead = +(S.settings.repeatAhead ?? 12);
+  if (!ahead) return today;
+  let ym = ymOf(today); for (let i = 0; i < ahead; i++) ym = nextYm(ym);
+  return occurrence(ym, 31);
+}
+function monthTaken(r, ym) { return (r.skips || []).includes(ym) || S.transactions.some((t) => t.recurringId === r.id && ymOf(t.date) === ym); }
+// returns how many copies dated today or earlier were added (future ones are added quietly)
 function runRecurring() {
-  const today = todayISO(); let added = 0;
+  const today = todayISO(), horizon = repeatHorizon(); let added = 0, due = 0;
   for (const r of S.recurring) {
     let guard = 0;
-    while (repeatActive(r) && r.nextDate <= today && guard++ < 240) {
-      S.transactions.push(recurringTx(r, r.nextDate, added)); added++;
+    while (repeatActive(r) && r.nextDate <= horizon && guard++ < 400) {
+      if (!monthTaken(r, ymOf(r.nextDate))) { S.transactions.push(recurringTx(r, r.nextDate, added)); added++; if (r.nextDate <= today) due++; }
       r.lastDate = r.nextDate;
       r.nextDate = occurrence(nextYm(ymOf(r.nextDate)), r.day);
     }
   }
   if (added) persist();
-  return added;
+  return due;
 }
-function upcomingIn(start, end) {
+// after a repeating payment changes: drop its untouched future copies and schedule again from now
+function rematerialize(r) {
+  const today = todayISO(); const removed = new Set();
+  S.transactions = S.transactions.filter((t) => {
+    if (t.recurringId === r.id && t.source === 'recurring' && t.date > today && !t.edited) { removed.add(ymOf(t.date)); return false; }
+    return true;
+  });
+  const thisYm = ymOf(today);
+  let n = occurrence(thisYm, r.day);
+  if (n < today && !removed.has(thisYm)) n = occurrence(nextYm(thisYm), r.day);
+  if (r.anchorMonth && ymOf(n) <= r.anchorMonth) n = occurrence(nextYm(r.anchorMonth), r.day);
+  if (!r.anchorMonth && r.startDate && n < r.startDate) n = firstOccurrenceFrom(r.day, r.startDate);
+  r.nextDate = n;
+}
+function removeFutureCopies(ids) {
   const today = todayISO();
-  return S.recurring.filter((r) => repeatActive(r) && r.nextDate > today && r.nextDate >= start && r.nextDate <= end)
-    .map((r) => ({ r, date: r.nextDate })).sort((a, b) => (a.date < b.date ? -1 : 1));
+  S.transactions = S.transactions.filter((t) => !(ids.includes(t.recurringId) && t.source === 'recurring' && t.date > today && !t.edited));
+}
+function scheduledIn(start, end) {
+  const today = todayISO();
+  return S.transactions.filter((t) => t.date > today && t.date >= start && t.date <= end && !t.excluded).sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+}
+function nextDue(r) {
+  const today = todayISO();
+  const d = S.transactions.filter((t) => t.recurringId === r.id && t.date > today).map((t) => t.date).sort()[0];
+  return d || (repeatActive(r) ? r.nextDate : null);
 }
 
 /* ================= needs / wants / savings groups ================= */
@@ -1926,11 +1969,13 @@ function txItem(t, selectable) {
   if (t.goalId && goal(t.goalId)) tags.push(`<span class="tag acc">${goal(t.goalId).emoji} ${esc(goal(t.goalId).name)}</span>`);
   if (t.excluded) tags.push('<span class="tag">Excluded</span>');
   if (t.splitGroup) tags.push('<span class="tag">Split</span>');
-  if (t.recurringId) tags.push('<span class="tag">Monthly</span>');
+  const sched = t.date > todayISO();
+  if (sched) tags.push('<span class="tag acc">Scheduled</span>');
+  else if (t.recurringId) tags.push('<span class="tag">Monthly</span>');
   if (c.kind === 'savings' && t.amount > 0) tags.push('<span class="tag">Taken out</span>');
   const a = acct(t.accountId);
   const sel = selectable && UI.select && UI.select.has(t.id);
-  return `<button class="item${sel ? ' selected' : ''}" data-act="${selectable ? 'toggle-sel' : 'edit-tx'}" data-id="${t.id}">
+  return `<button class="item${sel ? ' selected' : ''}${sched ? ' sched' : ''}" data-act="${selectable ? 'toggle-sel' : 'edit-tx'}" data-id="${t.id}">
     ${selectable ? `<input type="checkbox" class="checkbox" tabindex="-1" aria-hidden="true" ${sel ? 'checked' : ''}>` : ''}
     <span class="avatar" style="background:${hexA(c.color, 0.16)}">${c.emoji}</span>
     <span class="grow"><div class="t">${esc(t.merchant)}</div><div class="s">${bits.join('')}${a && S.accounts.length > 1 ? `<span class="faint">, ${esc(a.name)}</span>` : ''} ${tags.join(' ')}</div></span>
@@ -2019,7 +2064,9 @@ VIEWS.home = () => {
     </div>`;
   }
   const key = UI.period, r = periodRange(key), txs = txBetween(r.start, r.end), t = totals(txs);
-  const today = todayISO(), isCur = key === periodOf(today);
+  const today = todayISO(), isCur = key === periodOf(today), isFuture = r.start > today;
+  const actualTx = txs.filter((x) => x.date <= today), ta = totals(actualTx);
+  const schedTx = txs.filter((x) => x.date > today), ts = totals(schedTx);
   const daysLeft = isCur ? daysBetween(today, r.end) + 1 : 0;
   const bt = budgetTotal(), bs = budgetSpent(r);
   const budgeted = Object.keys(S.budgets).filter((id) => S.budgets[id] > 0 && catUsable(id));
@@ -2027,15 +2074,16 @@ VIEWS.home = () => {
   let sentence;
   const prevKey = shiftPeriod(key, -1);
   if (!txs.length) sentence = `Nothing recorded for <b>${esc(periodLabel(key))}</b> yet.`;
+  else if (isFuture) sentence = `Scheduled so far for ${esc(periodName(key))}: <b>${money(t.out)}</b> going out${t.income ? ` and <b>${money(t.income)}</b> coming in` : ''}.`;
   else if (bt > 0) {
     const left = round2(bt - bUsed);
-    if (isCur) sentence = left >= 0 ? `You have <b>${money(left)}</b> left in your budget, with <b>${daysLeft} day${daysLeft === 1 ? '' : 's'}</b> to go.` : `You're <b>${money(-left)} over</b> your budget, with <b>${daysLeft} day${daysLeft === 1 ? '' : 's'}</b> to go.`;
+    if (isCur) sentence = left >= 0 ? `You have <b>${money(left)}</b> left in your budget${schedTx.some((x) => kindOf(x.categoryId) === 'expense') ? ' after scheduled payments' : ''}, with <b>${daysLeft} day${daysLeft === 1 ? '' : 's'}</b> to go.` : `You're <b>${money(-left)} over</b> your budget, with <b>${daysLeft} day${daysLeft === 1 ? '' : 's'}</b> to go.`;
     else sentence = left >= 0 ? `You finished ${esc(periodName(key))} <b>${money(left)} under</b> budget.` : `You went <b>${money(-left)} over</b> budget in ${esc(periodName(key))}.`;
   } else if (hasData(prevKey) && coveredPeriod(prevKey)) {
     const pr = periodRange(prevKey);
     const cmpEnd = isCur ? addDays(pr.start, daysBetween(r.start, today)) : pr.end;
     const prevSpent = totals(txBetween(pr.start, cmpEnd)).spent;
-    const diff = round2(t.spent - prevSpent);
+    const diff = round2(ta.spent - prevSpent);
     const when = isCur ? 'at this point last month' : `in ${esc(periodName(prevKey))}`;
     sentence = Math.abs(diff) < 1 ? `About the same as ${when}.` : `That's <b>${money(Math.abs(diff))} ${diff > 0 ? 'more' : 'less'}</b> than ${when}.`;
   } else {
@@ -2050,12 +2098,13 @@ VIEWS.home = () => {
   if (backupDue()) banners.push(banner('shield', '', S.settings.lastBackupAt ? `Last backup ${relTime(S.settings.lastBackupAt)}` : 'Back up your data', 'Your data lives only in this browser. Save a backup file somewhere safe.', 'backup-download'));
   const cats = spendByCat(txs);
   const list = topWithRest(cats, 6);
-  const recent = txs.slice().sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0)).slice(0, 6);
+  const recent = isFuture ? schedTx.slice().sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0)).slice(0, 8) : actualTx.slice().sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0)).slice(0, 6);
+  const bsSched = budgetSpent(r, 'scheduled');
   const ins = insightsFor(key);
   const rec = detectRecurring();
   const bRows = budgeted.map((id) => ({ id, b: S.budgets[id], s: bs[id] || 0 })).sort((a, b) => b.s / b.b - a.s / a.b).slice(0, 4);
-  const pace = txs.length ? `<section class="panel"><div class="panel-head"><h2>Spending pace</h2><span class="small muted">${coveredPeriod(shiftPeriod(key, -1)) && hasData(shiftPeriod(key, -1)) ? `dashed line: ${esc(periodLabel(shiftPeriod(key, -1), true))}` : 'running total'}</span></div>${chartBox('c-pace', 'short')}</section>` : '';
-  if (txs.length) after(() => paceChart('c-pace', key));
+  const pace = txs.length && !isFuture ? `<section class="panel"><div class="panel-head"><h2>Spending pace</h2><span class="small muted">${coveredPeriod(shiftPeriod(key, -1)) && hasData(shiftPeriod(key, -1)) ? `dashed line: ${esc(periodLabel(shiftPeriod(key, -1), true))}` : 'running total'}</span></div>${chartBox('c-pace', 'short')}</section>` : '';
+  if (txs.length && !isFuture) after(() => paceChart('c-pace', key));
   if (list.length) after(() => donutChart('c-donut', list));
   const goalsTotal = sum(goals, goalBalance);
   return `<div class="stack">
@@ -2063,11 +2112,12 @@ VIEWS.home = () => {
       <div class="row between wrap" style="gap:8px">${periodNav()}</div>
       <p class="hero-sentence" style="margin-top:14px">${sentence}</p>
       <div class="hero-figs">
-        <div class="fig"><div class="v num">${money(t.spent)}</div><div class="l">Spent</div></div>
-        <div class="fig sm"><div class="v num">${money(t.saved)}</div><div class="l">Saved</div></div>
+        <div class="fig"><div class="v num">${money(t.spent)}</div><div class="l">${isFuture ? 'Spending scheduled' : 'Spent'}</div></div>
+        <div class="fig sm"><div class="v num">${money(t.saved)}</div><div class="l">${isFuture ? 'Saving scheduled' : 'Saved'}</div></div>
         <div class="fig sm"><div class="v num">${money(t.income)}</div><div class="l">Money in</div></div>
         ${t.realIncome > 0 ? `<div class="fig sm"><div class="v num ${t.net >= 0 ? 'good' : 'bad'}">${money(t.net, { sign: true })}</div><div class="l">Left over</div></div>` : ''}
       </div>
+      ${isCur && schedTx.length ? `<p class="small muted" style="margin:10px 0 0">Includes ${[ts.out ? `${money(ts.out)} scheduled to go out` : '', ts.income ? `${money(ts.income)} scheduled to come in` : ''].filter(Boolean).join(' and ')} before ${fmtDate(r.end)}.</p>` : ''}
       ${bt > 0 ? `<div style="margin-top:14px"><div class="meter ${bPct > 1 ? 'over' : bPct > 0.9 ? 'warn' : ''}" role="progressbar" aria-valuenow="${Math.round(bPct * 100)}" aria-valuemin="0" aria-valuemax="100" aria-label="Budget used"><i style="width:${Math.min(100, bPct * 100).toFixed(1)}%"></i>${tick != null ? `<span class="tick" style="left:${(tick * 100).toFixed(1)}%"></span>` : ''}</div>
         <div class="row between small muted" style="margin-top:6px"><span>${Math.round(bPct * 100)}% of ${money(bt, { cents: false })} budget</span>${tick != null ? `<span>${Math.round(tick * 100)}% of the month gone</span>` : ''}</div></div>` : ''}
     </section>
@@ -2084,7 +2134,7 @@ VIEWS.home = () => {
         <section class="panel"><div class="panel-head"><h2>Where it went</h2><button class="link" data-act="go" data-view="reports">Reports</button></div>
           ${list.length ? `<div class="donut-wrap"><div class="donut">${chartBox('c-donut')}<div class="center"><div><b class="num">${money(t.spent, { cents: false })}</b><span>spent</span></div></div></div>${catLegend(list, t.spent, r)}</div>` : '<p class="muted">No spending in this period.</p>'}
         </section>
-        <section class="panel flush"><div class="panel-head" style="padding-bottom:6px"><h2>Recent</h2><button class="link" data-act="go" data-view="tx">See all</button></div>
+        <section class="panel flush"><div class="panel-head" style="padding-bottom:6px"><h2>${isFuture ? 'Scheduled' : 'Recent'}</h2><button class="link" data-act="go" data-view="tx">See all</button></div>
           <div class="list">${recent.length ? recent.map((x) => txItem(x)).join('') : '<p class="muted" style="padding:0 16px 14px">No transactions in this period.</p>'}</div></section>
       </div>
       <div class="stack">
@@ -2092,7 +2142,7 @@ VIEWS.home = () => {
           <p class="small muted" style="margin:-4px 0 10px">${money(goalsTotal)} put away across ${goals.length} goal${goals.length === 1 ? '' : 's'}.</p>
           <div class="tanks scroll">${goals.map(goalCard).join('')}<button class="tank-card" data-act="new-goal" style="justify-content:center;align-items:center;color:var(--accent);min-height:160px">${ic('plus', 'big')}<span class="strong">New goal</span></button></div></section>
         ${bt > 0 ? `<section class="panel flush"><div class="panel-head" style="padding-bottom:4px"><h2>Budgets</h2><button class="link" data-act="go" data-view="budgets">All budgets</button></div>
-          <div class="list">${bRows.map((b) => budgetRow(b.id, b.b, b.s, isCur, daysLeft)).join('')}</div></section>`
+          <div class="list">${bRows.map((b) => budgetRow(b.id, b.b, b.s, isCur, daysLeft, bsSched[b.id] || 0)).join('')}</div></section>`
           : `<section class="panel"><h2>Set monthly budgets</h2><p class="muted small" style="margin:6px 0 12px">Give each category a monthly limit and see how you're tracking as you go.</p>
             <div class="row wrap"><button class="btn sm primary" data-act="suggest-budgets">${ic('sparkle')}Suggest from my spending</button><button class="btn sm" data-act="go" data-view="budgets">Set them myself</button></div></section>`}
         ${ins.length ? `<section class="panel"><div class="panel-head"><h2>Worth knowing</h2></div><div class="insights">${ins.map(insightHTML).join('')}</div></section>` : ''}
@@ -2128,12 +2178,12 @@ function macroPanel(txs, range) {
     <p class="tiny faint" style="margin:8px 0 0">Percentages are shares of your ${money(m.total, { cents: false })} going out (spent plus saved).${m.income > 0 ? '' : ' Add your pay as money in to compare each group with its target share of income.'}</p></section>`;
 }
 function comingUpPanel(key) {
-  if (key !== periodOf(todayISO()) || !S.recurring.length) return '';
+  if (key !== periodOf(todayISO())) return '';
   const r = periodRange(key);
-  const up = upcomingIn(r.start, r.end);
+  const up = scheduledIn(r.start, r.end);
   if (!up.length) return '';
   return `<section class="panel flush"><div class="panel-head" style="padding-bottom:4px"><h2>Coming up this month</h2><button class="link" data-act="open-repeats">Manage</button></div>
-    <div class="list">${up.map(({ r: x, date }) => { const c = cat(x.categoryId); return `<button class="item" data-act="rec-edit" data-id="${x.id}"><span class="avatar" style="background:${hexA(c.color, 0.16)}">${c.emoji}</span><span class="grow"><div class="t">${esc(x.name)}</div><div class="s">${fmtDate(date, 'day')}, ${esc(c.name)}</div></span>${amountHTML({ amount: x.amount, categoryId: x.categoryId })}</button>`; }).join('')}</div></section>`;
+    <div class="list">${up.slice(0, 8).map((x) => { const c = cat(x.categoryId); return `<button class="item" data-act="edit-tx" data-id="${x.id}"><span class="avatar" style="background:${hexA(c.color, 0.16)}">${c.emoji}</span><span class="grow"><div class="t">${esc(x.merchant)}</div><div class="s">${fmtDate(x.date, 'day')}, ${esc(c.name)}</div></span>${amountHTML(x)}</button>`; }).join('')}</div></section>`;
 }
 function insightHTML(i) {
   const icon = { up: 'up', down: 'down', sparkle: 'sparkle', tag: 'tag', alert: 'alert', repeat: 'repeat' }[i.icon] || 'sparkle';
@@ -2242,23 +2292,25 @@ function emptyState(icon, title, text, actions = '') {
 }
 
 /* ================= Budgets ================= */
-function budgetRow(id, b, s, isCur, daysLeft) {
+function budgetRow(id, b, s, isCur, daysLeft, sched = 0) {
   const c = cat(id); const pct = b > 0 ? s / b : 0; const left = b - s;
+  const actualPct = b > 0 ? Math.max(0, s - sched) / b : 0;
   const cls = pct > 1 ? 'over' : pct > 0.85 ? 'warn' : '';
   let note = '';
   if (isCur && left > 0 && daysLeft > 0) note = `About ${money(left / daysLeft, { cents: false })} a day for ${daysLeft} day${daysLeft === 1 ? '' : 's'}`;
   return `<button class="brow" data-act="edit-budget" data-id="${id}">
     <div class="top"><span class="avatar" style="width:32px;height:32px;font-size:16px;border-radius:10px;background:${hexA(c.color, 0.16)}">${c.emoji}</span>
       <span class="name">${esc(c.name)}</span><span class="num strong ${left < 0 ? 'bad' : ''}">${left < 0 ? `${money(-left)} over` : `${money(left)} left`}</span></div>
-    <div class="meter ${cls}"><i style="width:${Math.min(100, pct * 100).toFixed(1)}%"></i></div>
-    <div class="meta"><span class="num">${money(s)} of ${money(b, { cents: false })}</span><span>${note}</span></div></button>`;
+    <div class="meter ${cls}"><i style="width:${Math.min(100, actualPct * 100).toFixed(1)}%"></i>${sched > 0.004 ? `<i class="sched" style="left:${Math.min(100, actualPct * 100).toFixed(1)}%;width:${Math.max(0, Math.min(100, pct * 100) - Math.min(100, actualPct * 100)).toFixed(1)}%"></i>` : ''}</div>
+    <div class="meta"><span class="num">${money(s)} of ${money(b, { cents: false })}${sched > 0.004 ? `, incl. ${money(sched, { cents: false })} scheduled` : ''}</span><span>${note}</span></div></button>`;
 }
 VIEWS.budgets = () => {
   const key = UI.period, r = periodRange(key);
   const isCur = key === periodOf(todayISO());
   const daysLeft = isCur ? daysBetween(todayISO(), r.end) + 1 : 0;
-  const bs = budgetSpent(r);
+  const bs = budgetSpent(r), bsSched = budgetSpent(r, 'scheduled');
   const bt = budgetTotal();
+  const schedOut = round2(sum(scheduledIn(r.start, r.end).filter((t) => ['expense', 'savings'].includes(kindOf(t.categoryId))), (t) => -t.amount));
   const budgeted = Object.keys(S.budgets).filter((id) => S.budgets[id] > 0 && catUsable(id));
   const spentOnBudgeted = round2(sum(budgeted, (id) => bs[id] || 0));
   const unbudgeted = Object.entries(bs).filter(([id, v]) => !budgeted.includes(id) && v > 0.004).sort((a, b) => b[1] - a[1]);
@@ -2280,13 +2332,13 @@ VIEWS.budgets = () => {
         <dt>Monthly take-home pay</dt><dd><button class="link num" data-act="edit-income">${inc ? money(inc) : 'Set it'}</button></dd>
         <dt>Budgeted spending</dt><dd class="num">${money(bt)}</dd>
         <dt>Planned savings</dt><dd class="num">${money(plannedSavings)}</dd>
-        <dt>Saved ${isCur ? 'so far' : 'this month'}</dt><dd class="num">${money(totals(txBetween(r.start, r.end)).saved)}</dd>
-        ${isCur && upcomingIn(r.start, r.end).length ? `<dt>Repeating payments still to come</dt><dd class="num"><button class="link num" data-act="open-repeats">${money(-sum(upcomingIn(r.start, r.end), (x) => x.r.amount))}</button></dd>` : ''}
+        <dt>Saved ${isCur ? 'so far' : r.start > todayISO() ? '(scheduled)' : 'this month'}</dt><dd class="num">${money(totals(txBetween(r.start, r.end).filter((t) => r.start > todayISO() || t.date <= todayISO())).saved)}</dd>
+        ${schedOut > 0.004 && r.start <= todayISO() ? `<dt>Scheduled still to go out</dt><dd class="num"><button class="link num" data-act="open-repeats">${money(schedOut)}</button></dd>` : ''}
         ${inc ? `<dt>${unassigned >= 0 ? 'Not yet assigned' : 'Over-assigned'}</dt><dd class="num ${unassigned < 0 ? 'bad' : 'good'}">${money(Math.abs(unassigned))}</dd>` : ''}
       </dl>
     </section>
     ${rows.length ? S.groups.map((g) => ({ g, rs: rows.filter((x) => groupOf(x.id) === g.id) })).concat([{ g: { name: 'Not grouped yet' }, rs: rows.filter((x) => !groupOf(x.id)) }]).filter((x) => x.rs.length).map(({ g, rs }) =>
-      `<div class="grouphead"><span>${esc(g.name)}</span><span class="num">${money(sum(rs, (x) => x.s), { cents: false })} of ${money(sum(rs, (x) => x.b), { cents: false })}</span></div><section class="panel flush"><div class="list">${rs.map((x) => budgetRow(x.id, x.b, x.s, isCur, daysLeft)).join('')}</div></section>`).join('')
+      `<div class="grouphead"><span>${esc(g.name)}</span><span class="num">${money(sum(rs, (x) => x.s), { cents: false })} of ${money(sum(rs, (x) => x.b), { cents: false })}</span></div><section class="panel flush"><div class="list">${rs.map((x) => budgetRow(x.id, x.b, x.s, isCur, daysLeft, bsSched[x.id] || 0)).join('')}</div></section>`).join('')
       : emptyState('gauge', 'No budgets yet', 'Set a monthly limit for the categories you want to keep an eye on. Keel can suggest amounts based on what you usually spend.', `${S.transactions.length ? `<button class="btn primary" data-act="suggest-budgets">${ic('sparkle')}Suggest budgets</button>` : ''}<button class="btn" data-act="add-budget">Add a budget</button>`)}
     ${rows.length && S.transactions.length ? `<div><button class="btn sm ghost" data-act="suggest-budgets">${ic('sparkle')}Refresh suggestions from my spending</button></div>` : ''}
     ${unbudgeted.length ? `<h2 class="section-title">Spending without a budget</h2><section class="panel flush"><div class="list">${unbudgeted.map(([id, v]) => { const c = cat(id); return `<button class="item" data-act="edit-budget" data-id="${id}"><span class="avatar" style="background:${hexA(c.color, 0.16)}">${c.emoji}</span><span class="grow"><div class="t">${esc(c.name)}</div><div class="s">Tap to set a budget</div></span><span class="amt num">${money(v)}</span></button>`; }).join('')}</div></section>` : ''}
@@ -2304,7 +2356,7 @@ VIEWS.goals = () => {
   const addedThisMonth = round2(sum(goals, (g) => goalSavedIn(g, r.start, r.end)));
   return `<div class="stack">
     <section class="hero">
-      <p class="hero-sentence" style="margin:0 0 12px">You've put away <b>${money(total)}</b> across ${goals.length} goal${goals.length === 1 ? '' : 's'}.${planned > 0 ? ` This month you've added <b>${money(addedThisMonth)}</b> of the <b>${money(planned)}</b> you planned.` : ''}</p>
+      <p class="hero-sentence" style="margin:0 0 12px">${total >= 0 ? `You've put away <b>${money(total)}</b> across ${goals.length} goal${goals.length === 1 ? '' : 's'}.` : `Your goals are <b>${money(-total)} below zero</b>, which usually means spending was marked as paid from a goal before money was put in. Tap a goal to see its history.`}${planned > 0 ? ` This month you've added <b>${money(addedThisMonth)}</b> of the <b>${money(planned)}</b> you planned.` : ''}</p>
       ${planned > 0 ? `<div class="meter"><i style="width:${Math.min(100, addedThisMonth / planned * 100).toFixed(1)}%"></i></div>` : ''}
       <div class="row wrap" style="margin-top:14px"><button class="btn primary" data-act="add-savings">${ic('plus')}Add money</button><button class="btn" data-act="new-goal">New goal</button></div>
     </section>
@@ -2320,7 +2372,7 @@ VIEWS.goals = () => {
 function reportRange() {
   const rr = UI.report; const today = todayISO(); const cur = periodOf(today);
   const firstData = S.transactions.reduce((m, t) => (t.date < m ? t.date : m), today);
-  const lastData = S.transactions.reduce((m, t) => (t.date > m ? t.date : m), '0000');
+  const lastData = S.transactions.reduce((m, t) => (t.date > m && t.date <= today ? t.date : m), '0000');
   const months = (n) => ({ start: periodRange(shiftPeriod(cur, -(n - 1))).start, end: periodRange(cur).end });
   let r;
   switch (rr.range) {
@@ -2714,7 +2766,10 @@ function sheetTx(id, preset = {}) {
   const st = {
     kind: orig ? kindOf(f.categoryId) : (preset.kind || 'expense'),
     abs: orig ? Math.abs(f.amount) : '', refund: orig ? (kindOf(f.categoryId) === 'expense' && f.amount > 0) : false,
-    dirIn: orig ? f.amount > 0 : false, catChanged: false, remember: true, applyAll: false,
+    dirIn: orig && kindOf(orig.categoryId) === 'transfer' ? f.amount > 0 : false,
+    saveOut: orig && kindOf(orig.categoryId) === 'savings' ? f.amount > 0 : false,
+    fromGoal: !!(orig && orig.goalId),
+    catChanged: false, remember: true, applyAll: false,
     rep: { on: !!preset.repeat, day: +String(f.date).slice(8, 10) || 1, until: '', dayTouched: false }
   };
   if (!orig && preset.kind && kindOf(f.categoryId) !== preset.kind) f.categoryId = kindDefaultCat(preset.kind);
@@ -2725,6 +2780,16 @@ function sheetTx(id, preset = {}) {
   e.data.tx = { f, st, orig };
   drawTxSheet(e);
 }
+function savingsPreview(e) {
+  const { f, st, orig } = e.data.tx;
+  const id = String(f.categoryId || '');
+  if (!id.startsWith('goal:')) return '';
+  const g = goal(id.slice(5)); if (!g) return '';
+  const before = round2(goalBalance(g) - (orig && !orig.excluded && (orig.categoryId === id || orig.goalId === g.id) ? goalContribution(orig) : 0));
+  const abs = Math.abs(parseAmount(st.abs)) || 0;
+  const after = round2(before + (st.saveOut ? -abs : abs));
+  return `${g.emoji} ${esc(g.name)}: ${money(before)} → <b class="${after < before ? 'warn' : 'good'}">${money(after)}</b>`;
+}
 function syncTxFields(e) {
   const { f, st } = e.data.tx;
   $$('[data-field]', e.el).forEach((i) => {
@@ -2733,6 +2798,7 @@ function syncTxFields(e) {
     if (k === 'abs') st.abs = v;
     else if (k === 'refund') st.refund = v;
     else if (k === 'dirIn') st.dirIn = v;
+    else if (k === 'fromGoal') st.fromGoal = v;
     else if (k === 'remember') st.remember = v;
     else if (k === 'applyAll') st.applyAll = v;
     else if (k === 'repOn') st.rep.on = v;
@@ -2754,10 +2820,11 @@ function drawTxSheet(e) {
   setSheetBody(e, `
     <div class="seg" role="group" aria-label="Type">${[['expense', 'Spending'], ['savings', 'Savings'], ['income', 'Money in'], ['transfer', 'Transfer']].map(([k, l]) => `<button data-act="tx-kind" data-v="${k}" aria-pressed="${st.kind === k}">${l}</button>`).join('')}</div>
     <div class="stack" style="margin-top:14px">
-      <label class="field">Amount<input class="input amount-input num" data-field="abs" inputmode="decimal" placeholder="0.00" value="${st.abs === '' ? '' : esc(st.abs)}" ${orig ? '' : 'data-autofocus'}></label>
+      <label class="field">Amount<input class="input amount-input num" data-field="abs" data-input="tx-abs" inputmode="decimal" placeholder="0.00" value="${st.abs === '' ? '' : esc(st.abs)}" ${orig ? '' : 'data-autofocus'}></label>
       ${st.kind === 'expense' ? `<label class="toggle"><input type="checkbox" data-field="refund" ${st.refund ? 'checked' : ''}>This is a refund or return (money back)</label>` : ''}
       ${st.kind === 'transfer' ? `<label class="toggle"><input type="checkbox" data-field="dirIn" ${st.dirIn ? 'checked' : ''}>Money coming into this account (like a card payment)</label>` : ''}
-      ${st.kind === 'savings' ? `<label class="toggle"><input type="checkbox" data-field="dirIn" ${st.dirIn ? 'checked' : ''}>Taking money back out of savings</label>` : ''}
+      ${st.kind === 'savings' ? `<div class="seg" role="group" aria-label="Direction"><button data-act="tx-savedir" data-v="in" aria-pressed="${!st.saveOut}">Put money in</button><button data-act="tx-savedir" data-v="out" aria-pressed="${st.saveOut}">Take money out</button></div>
+        <div class="small" id="tx-goal-preview" style="margin-top:-4px">${savingsPreview(e)}</div>` : ''}
       <label class="field">Name<input class="input" data-field="merchant" value="${esc(f.merchant)}" placeholder="Where or what was it?" autocomplete="off"></label>
       ${orig && orig.description && orig.description !== orig.merchant ? `<div class="tiny faint" style="margin-top:-8px">On statement: ${esc(orig.description)}${orig.foreign ? `, ${esc(orig.foreign)}` : ''}</div>` : ''}
       <div class="grid2">
@@ -2769,7 +2836,7 @@ function drawTxSheet(e) {
       ${st.catChanged && f.merchantKey && c.id !== 'uncategorized' ? `<div class="panel" style="padding:8px 14px;background:var(--surface-2)">
         <label class="toggle"><input type="checkbox" data-field="remember" ${st.remember ? 'checked' : ''}>Always use ${esc(c.name)} for ${esc(displayName(f.merchantKey))}</label>
         ${others ? `<label class="toggle"><input type="checkbox" data-field="applyAll" ${st.applyAll ? 'checked' : ''}>Also change ${others} other ${esc(displayName(f.merchantKey))} transaction${others === 1 ? '' : 's'}</label>` : ''}</div>` : ''}
-      ${rec ? `<div class="panel" style="padding:10px 14px;background:var(--surface-2)"><div class="row between"><span class="small"><b>${esc(repeatLabel(rec))}</b>${repeatActive(rec) ? `, next on ${fmtDate(rec.nextDate)}` : ', stopped'}. Changes here only affect this one.</span><button class="link small" data-act="rec-edit" data-id="${rec.id}">Edit repeat</button></div></div>` : ''}
+      ${rec ? `<div class="panel" style="padding:10px 14px;background:var(--surface-2)"><div class="row between"><span class="small"><b>${esc(repeatLabel(rec))}</b>${nextDue(rec) ? `, next on ${fmtDate(nextDue(rec))}` : ', stopped'}. Changes here only affect this one${orig.date > todayISO() ? '; deleting it skips this month' : ''}.</span><button class="link small" data-act="rec-edit" data-id="${rec.id}">Edit repeat</button></div></div>` : ''}
       ${canRepeat ? `<div class="panel" style="padding:6px 14px;background:var(--surface-2)">
         <label class="toggle"><input type="checkbox" data-field="repOn" data-change="tx-rep" ${st.rep.on ? 'checked' : ''}><b>Repeat every month</b></label>
         ${st.rep.on ? `<div class="grid2" style="padding-bottom:10px">
@@ -2778,13 +2845,23 @@ function drawTxSheet(e) {
           <p class="tiny muted" style="margin:0 0 8px">${importedTx
             ? 'From next time it\'s due, a copy is added automatically on that day each month. When the real charge arrives on a later statement, it replaces the copy, so the exact amount is kept and nothing is counted twice.'
             : 'A copy is added automatically on that day each month. If the date above is in an earlier month, the months since then are filled in too.'}</p>` : ''}</div>` : ''}
-      ${goals.length && st.kind === 'expense' ? `<label class="field">Paid from savings goal<select class="input" data-field="goalId"><option value="">None</option>${goals.map((g) => `<option value="${g.id}" ${f.goalId === g.id ? 'selected' : ''}>${g.emoji} ${esc(g.name)}</option>`).join('')}</select></label>` : ''}
+      ${goals.length && st.kind === 'expense' ? `<div class="panel" style="padding:6px 14px;background:var(--surface-2)">
+        <label class="toggle"><input type="checkbox" data-field="fromGoal" data-change="tx-fromgoal" ${st.fromGoal ? 'checked' : ''}>Paid for with money from a savings goal</label>
+        ${st.fromGoal ? `<label class="field" style="padding-bottom:6px">Which goal<select class="input" data-field="goalId">${goals.map((g) => `<option value="${g.id}" ${f.goalId === g.id ? 'selected' : ''}>${g.emoji} ${esc(g.name)}</option>`).join('')}</select></label>
+          <p class="tiny muted" style="margin:0 0 8px">The amount comes <b>out of</b> that goal and doesn't count against your budget. To put money <b>into</b> a goal, choose Savings at the top instead.</p>` : ''}</div>` : ''}
       <label class="field">Notes<textarea class="input" data-field="notes" placeholder="Optional">${esc(f.notes || '')}</textarea></label>
       <label class="field">Tags<input class="input" data-field="tags" value="${esc((f.tags || []).join(', '))}" placeholder="e.g. work, holiday (comma separated)"></label>
       <label class="toggle"><input type="checkbox" data-field="excluded" ${f.excluded ? 'checked' : ''}>Leave out of reports and budgets</label>
 
       ${orig ? `<div class="row wrap"><button class="btn sm" data-act="tx-split">${ic('split')}Split into categories</button>${f.merchantKey ? `<button class="btn sm" data-act="search-merchant" data-key="${esc(f.merchantKey)}">${ic('search')}All from this merchant</button>` : ''}</div>` : ''}
     </div>`);
+}
+function resetDirection(e, kind) {
+  const { st, orig } = e.data.tx;
+  const same = orig && kindOf(orig.categoryId) === kind;
+  st.dirIn = same && kind === 'transfer' ? orig.amount > 0 : false;
+  st.saveOut = same && kind === 'savings' ? orig.amount > 0 : false;
+  st.refund = same && kind === 'expense' ? orig.amount > 0 : false;
 }
 function saveTxSheet() {
   const e = topSheet(); if (!e || !e.data.tx) return;
@@ -2794,13 +2871,14 @@ function saveTxSheet() {
   if (!abs || isNaN(abs)) { toast('Enter an amount first.'); $('[data-field="abs"]', e.el)?.focus(); return; }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(f.date || '')) { toast('Choose a date.'); return; }
   if (kindOf(f.categoryId) !== st.kind) f.categoryId = kindDefaultCat(st.kind);
-  const amount = round2(st.kind === 'expense' ? (st.refund ? abs : -abs) : st.kind === 'income' ? abs : (st.dirIn ? abs : -abs));
-  if (st.kind !== 'expense') f.goalId = '';
+  const amount = round2(st.kind === 'expense' ? (st.refund ? abs : -abs) : st.kind === 'income' ? abs : st.kind === 'savings' ? (st.saveOut ? abs : -abs) : (st.dirIn ? abs : -abs));
+  if (st.kind !== 'expense' || !st.fromGoal) f.goalId = '';
   const name = String(f.merchant || '').trim() || (orig && orig.description) || 'Transaction';
   const patch = { date: f.date, merchant: name, amount, categoryId: f.categoryId, accountId: f.accountId || '', notes: f.notes || '', tags: f.tags || [], goalId: f.goalId || '', excluded: !!f.excluded };
   let t;
   if (orig) {
     t = orig;
+    if (t.source === 'recurring') t.edited = true;
     if (t.categoryId !== patch.categoryId) t.catSource = 'manual';
     Object.assign(t, patch);
     if (!t.description) { t.description = name; t.merchantKey = merchantKey(name); }
@@ -2831,10 +2909,11 @@ function saveTxSheet() {
       if (ymOf(next) <= ymOf(latest)) next = occurrence(nextYm(ymOf(latest)), day);
     }
     const r = { id: uid('rp'), name: t.merchant, matchKey: t.merchantKey || merchantKey(t.merchant), amount: t.amount, categoryId: t.categoryId, accountId: t.accountId || '', notes: t.notes || '', day,
-      startDate: t.date, endDate: st.rep.until || '', lastDate: t.date, nextDate: next, paused: false, createdAt: Date.now() };
+      startDate: t.date, endDate: st.rep.until || '', lastDate: t.date, nextDate: next, paused: false, anchorMonth: ymOf(t.date), skips: [], createdAt: Date.now() };
     S.recurring.push(r); t.recurringId = r.id;
     const n = runRecurring();
-    repMsg = n ? `. Repeats monthly; ${n} earlier month${n === 1 ? '' : 's'} added too` : `. Repeats monthly, next on ${fmtDate(r.nextDate)}`;
+    const nd = nextDue(r);
+    repMsg = n ? `. Repeats monthly; ${n} earlier month${n === 1 ? '' : 's'} added too` : `. Repeats monthly${nd ? `, next on ${fmtDate(nd)}` : ''}`;
   }
   persist();
   closeSheet();
@@ -2843,11 +2922,15 @@ function saveTxSheet() {
   toast((orig ? `Saved${extraMsg}` : 'Transaction added') + repMsg);
 }
 function deleteTx(ids, label) {
-  const removed = [];
+  const removed = [], skipped = [];
   S.transactions = S.transactions.filter((t, i) => { if (ids.includes(t.id)) { removed.push([i, t]); return false; } return true; });
+  for (const [, t] of removed) {
+    const r = t.recurringId && S.recurring.find((x) => x.id === t.recurringId);
+    if (r) { const ym = ymOf(t.date); r.skips = r.skips || []; if (!r.skips.includes(ym)) { r.skips.push(ym); skipped.push([r, ym]); } }
+  }
   persist(); render(); refreshSheets();
   toast(label || `Deleted ${removed.length} transaction${removed.length === 1 ? '' : 's'}`, {
-    action: 'Undo', fn: () => { for (const [i, t] of removed) S.transactions.splice(i, 0, t); persist(); render(); refreshSheets(); }
+    action: 'Undo', fn: () => { for (const [i, t] of removed) S.transactions.splice(i, 0, t); for (const [r, ym] of skipped) r.skips = r.skips.filter((x) => x !== ym); persist(); render(); refreshSheets(); }
   });
 }
 function refreshSheets() { const e = topSheet(); if (e && e.data.refresh) e.data.refresh(); }
@@ -2936,14 +3019,14 @@ function sheetGoal(id) {
           <div class="small muted" style="margin-top:8px;line-height:1.5">${g.target > 0 && bal >= g.target ? 'Target reached. Nice work.' : ''}
           ${need ? `Put away about <b>${money(need, { cents: false })}</b> a month to reach it by ${fmtDate(g.targetDate, 'long')}.<br>` : ''}
           ${(() => { const r = goalRepeat(g.id); return r ? `<b>${money(-r.amount, { cents: false })}</b> added automatically, ${repeatLabel(r).toLowerCase()}. <button class="link small" data-act="rec-edit" data-id="${r.id}">Change</button><br>` : (g.monthly > 0 ? `Planned: ${money(g.monthly, { cents: false })} a month.<br>` : ''); })()}${!g.target ? '<button class="link small" data-act="goal-edit" data-id="' + g.id + '">Set a target</button>' : ''}</div></div></div>
-      ${hist.length >= 2 ? `<div class="grouplabel" style="margin-top:18px">Balance over time</div>${chartBox('c-goal', 'short')}` : ''}
+      ${hist.filter((h) => !h.scheduled).length >= 2 ? `<div class="grouplabel" style="margin-top:18px">Balance over time</div>${chartBox('c-goal', 'short')}` : ''}
       <div class="grouplabel" style="margin-top:18px">History</div>
-      ${hist.length ? `<div class="panel flush list">${hist.map((h) => `<div class="item"><span class="grow"><div class="t">${esc(h.note || (h.amount >= 0 ? 'Added' : 'Taken out'))}</div><div class="s">${fmtDate(h.date, 'long')}${h.recurring ? ', added automatically' : ''}${h.type === 'entry' ? ', not counted as money out' : ''}</div></span>
+      ${hist.length ? `<div class="panel flush list">${hist.map((h) => `<div class="item"><span class="grow"><div class="t">${esc(h.note || (h.amount >= 0 ? 'Added' : 'Taken out'))}</div><div class="s">${fmtDate(h.date, 'long')}${h.scheduled ? ', scheduled' : h.recurring ? ', added automatically' : ''}${h.type === 'entry' ? ', not counted as money out' : ''}</div></span>
           <span class="amt num ${h.amount >= 0 ? 'in' : ''}">${h.amount >= 0 ? '+' : '−'}${money(Math.abs(h.amount))}</span>
           ${h.type === 'entry' ? `<button class="iconbtn plain" data-act="goal-entry-del" data-id="${h.id}" aria-label="Delete entry">${ic('trash')}</button>` : `<button class="iconbtn plain" data-act="edit-tx" data-id="${h.id}" aria-label="Open transaction">${ic('chevR')}</button>`}</div>`).join('')}</div>`
         : '<p class="muted small">Nothing added yet. Tap "Add money" when you move money into savings.</p>'}`);
-    if (hist.length >= 2) {
-      const pts = hist.slice().reverse(); let run = 0; const byDate = new Map();
+    if (hist.filter((h) => !h.scheduled).length >= 2) {
+      const pts = hist.filter((h) => !h.scheduled).reverse(); let run = 0; const byDate = new Map();
       for (const h of pts) { run += h.amount; byDate.set(h.date, round2(run)); }
       const dates = [...byDate.keys()];
       mkChart('c-goal', { type: 'line', data: { labels: dates.map((d) => fmtDate(d)), datasets: [{ label: 'Balance', data: [...byDate.values()], borderColor: g.color, backgroundColor: hexA(g.color, 0.15), fill: 'origin', stepped: true, pointRadius: 2, borderWidth: 2 }] }, options: baseOpts({}) });
@@ -3007,16 +3090,17 @@ function saveGoal() {
   if (g.autoOn && clean.monthly > 0) {
     const day = clamp(+g.autoDay || 1, 1, 31);
     if (existing) {
-      if (existing.day !== day) existing.nextDate = occurrence(ymOf(existing.nextDate || todayISO()), day);
       Object.assign(existing, { amount: -clean.monthly, day, name: `${clean.name} savings`, paused: false });
+      rematerialize(existing);
     } else {
       S.recurring.push({ id: uid('rp'), goalId: gid, name: `${clean.name} savings`, amount: -clean.monthly, categoryId: 'goal:' + gid, accountId: '', notes: '', day,
-        startDate: todayISO(), endDate: '', lastDate: null, nextDate: firstOccurrenceFrom(day, todayISO()), paused: false, createdAt: Date.now() });
+        startDate: todayISO(), endDate: '', lastDate: null, nextDate: firstOccurrenceFrom(day, todayISO()), paused: false, anchorMonth: null, skips: [], createdAt: Date.now() });
     }
     runRecurring();
     const r = goalRepeat(gid);
-    msg += `. ${money(clean.monthly, { cents: false })} will be added ${repeatLabel(r).toLowerCase()}, next on ${fmtDate(r.nextDate)}`;
+    msg += `. ${money(clean.monthly, { cents: false })} will be added ${repeatLabel(r).toLowerCase()}${nextDue(r) ? `, next on ${fmtDate(nextDue(r))}` : ''}`;
   } else if (existing) {
+    removeFutureCopies([existing.id]);
     S.recurring = S.recurring.filter((x) => x !== existing);
     if (g.autoOn && !(clean.monthly > 0)) msg += '. Set a monthly amount to add it automatically';
   } else if (g.autoOn) msg += '. Set a monthly amount to add it automatically';
@@ -3103,13 +3187,16 @@ function sheetRecurring() {
 function sheetRepeats() {
   const e = openSheet({ title: 'Repeating payments', wide: true, foot: '<button class="btn primary grow" data-act="repeat-new">Add a repeating payment</button>' });
   e.data.refresh = () => {
-    const list = S.recurring.slice().sort((a, b) => (repeatActive(b) - repeatActive(a)) || String(a.nextDate).localeCompare(String(b.nextDate)));
+    const list = S.recurring.slice().sort((a, b) => (!!nextDue(b) - !!nextDue(a)) || String(nextDue(a)).localeCompare(String(nextDue(b))));
+    const ahead = +(S.settings.repeatAhead ?? 12);
     const monthlyOut = sum(list.filter((r) => repeatActive(r) && r.amount < 0), (r) => -r.amount);
     const monthlyIn = sum(list.filter((r) => repeatActive(r) && r.amount > 0), (r) => r.amount);
-    setSheetBody(e, `<p class="small muted" style="margin-top:0">These are added to your transactions automatically each month, on their day. Changing one only affects future months.</p>
+    setSheetBody(e, `<p class="small muted" style="margin-top:0">These are added to your transactions automatically. Future months are filled in ahead as <b>scheduled</b> entries, so you can plan with them; they count as real on their day. Changing a repeating payment updates its future copies.</p>
+      <div class="small strong muted" style="margin-bottom:6px">Fill in ahead</div>
+      <div class="seg" role="group" aria-label="Fill in ahead" style="margin-bottom:14px">${[[0, 'When due'], [3, '3 months'], [6, '6 months'], [12, '12 months']].map(([v, l]) => `<button data-act="repeat-ahead" data-v="${v}" aria-pressed="${ahead === v}">${l}</button>`).join('')}</div>
       ${list.length ? `<div class="hero-figs" style="margin-bottom:12px"><div class="fig sm"><div class="v num">${money(monthlyOut)}</div><div class="l">Out each month</div></div>${monthlyIn ? `<div class="fig sm"><div class="v num">${money(monthlyIn)}</div><div class="l">In each month</div></div>` : ''}</div>
-        <div class="panel flush list">${list.map((r) => { const c = cat(r.categoryId); const on = repeatActive(r); return `<button class="item" data-act="rec-edit" data-id="${r.id}" style="${on ? '' : 'opacity:.55'}"><span class="avatar" style="background:${hexA(c.color, 0.16)}">${c.emoji}</span>
-          <span class="grow"><div class="t">${esc(r.name)}</div><div class="s">${esc(repeatLabel(r))}, ${on ? `next ${fmtDate(r.nextDate)}` : r.paused ? 'paused' : 'finished'}</div></span>${amountHTML({ amount: r.amount, categoryId: r.categoryId })}</button>`; }).join('')}</div>`
+        <div class="panel flush list">${list.map((r) => { const c = cat(r.categoryId); const on = !!nextDue(r); return `<button class="item" data-act="rec-edit" data-id="${r.id}" style="${on ? '' : 'opacity:.55'}"><span class="avatar" style="background:${hexA(c.color, 0.16)}">${c.emoji}</span>
+          <span class="grow"><div class="t">${esc(r.name)}</div><div class="s">${esc(repeatLabel(r))}, ${nextDue(r) ? `next ${fmtDate(nextDue(r))}` : r.paused ? 'paused' : 'finished'}</div></span>${amountHTML({ amount: r.amount, categoryId: r.categoryId })}</button>`; }).join('')}</div>`
         : '<p class="muted">Nothing repeating yet. Add rent, bills, your pay or a monthly savings amount, and it will be filled in for you every month.</p>'}`);
   };
   e.data.refresh();
@@ -3131,7 +3218,7 @@ function sheetRepeatEdit(id) {
         <label class="field">Account<select class="input" data-rf="accountId"><option value="">No account</option>${S.accounts.map((a) => `<option value="${a.id}" ${rp.accountId === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
       </div>
       <label class="toggle"><input type="checkbox" data-rf="paused" ${rp.paused ? 'checked' : ''}>Pause (skip months until you turn this off)</label>
-      <p class="small muted" style="margin:0">${repeatActive(r) ? `Next one: ${fmtDate(r.nextDate, 'long')}.` : ''} ${S.transactions.filter((t) => t.recurringId === r.id).length} added so far; those stay as they are.</p></div>`);
+      <p class="small muted" style="margin:0">${nextDue(r) ? `Next one: ${fmtDate(nextDue(r), 'long')}.` : ''} ${S.transactions.filter((t) => t.recurringId === r.id).length} added so far; those stay as they are.</p></div>`);
   };
   e.data.draw();
 }
@@ -3148,16 +3235,8 @@ function saveRepeat() {
   if (!abs) { toast('Enter an amount first.'); return; }
   const k = kindOf(rp.categoryId);
   const amount = round2(k === 'income' ? abs : (k === 'expense' ? -abs : (rp.dirIn ? abs : -abs)));
-  const today = todayISO();
-  const wasPaused = !!r.paused;
-  if (rp.day !== r.day && r.nextDate) r.nextDate = occurrence(ymOf(r.nextDate), rp.day);
-  if (wasPaused && !rp.paused) {
-    // resume from today; don't fill in the months that were skipped
-    let n = firstOccurrenceFrom(rp.day, today);
-    if (r.lastDate && ymOf(n) <= ymOf(r.lastDate)) n = occurrence(nextYm(ymOf(r.lastDate)), rp.day);
-    r.nextDate = n;
-  }
   Object.assign(r, { name: String(rp.name).trim() || r.name, amount, categoryId: rp.categoryId, accountId: rp.accountId || '', day: rp.day, endDate: rp.until || '', paused: !!rp.paused });
+  rematerialize(r); // refresh its future copies (ones you changed individually are kept)
   if (String(r.categoryId).startsWith('goal:')) { r.goalId = r.categoryId.slice(5); const g = goal(r.goalId); if (g) g.monthly = r.amount < 0 ? -r.amount : g.monthly; }
   else delete r.goalId;
   const n = runRecurring();
@@ -3643,11 +3722,11 @@ async function restoreFromText(text) {
 }
 function exportCSV() {
   const q = (v) => { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-  const lines = [['Date', 'Name', 'Description', 'Category', 'Group', 'Type', 'Amount', 'Account', 'Savings goal', 'Notes', 'Tags', 'Excluded'].join(',')];
+  const lines = [['Date', 'Name', 'Description', 'Category', 'Group', 'Type', 'Amount', 'Account', 'Savings goal', 'Notes', 'Tags', 'Excluded', 'Scheduled'].join(',')];
   const txs = S.transactions.slice().sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
   for (const t of txs) {
     const c = cat(t.categoryId); const a = acct(t.accountId); const g = goal(t.goalId);
-    lines.push([t.date, t.merchant, t.description, c.name, (groupById(groupOf(t.categoryId) || '') || {}).name || '', c.kind, t.amount.toFixed(2), a ? a.name : '', g ? g.name : '', t.notes || '', (t.tags || []).join('; '), t.excluded ? 'yes' : ''].map(q).join(','));
+    lines.push([t.date, t.merchant, t.description, c.name, (groupById(groupOf(t.categoryId) || '') || {}).name || '', c.kind, t.amount.toFixed(2), a ? a.name : '', g ? g.name : '', t.notes || '', (t.tags || []).join('; '), t.excluded ? 'yes' : '', t.date > todayISO() ? 'yes' : ''].map(q).join(','));
   }
   saveFile(`keel-transactions-${todayISO()}.csv`, lines.join('\n'), 'text/csv').then((r) => {
     if (r === 'saved') toast('Transactions exported');
@@ -3701,16 +3780,18 @@ const ACTIONS = {
   'tx-kind': (el) => {
     const e = topSheet(); syncTxFields(e);
     const { f, st } = e.data.tx;
+    if (st.kind !== el.dataset.v) resetDirection(e, el.dataset.v);
     st.kind = el.dataset.v;
     if (kindOf(f.categoryId) !== st.kind) f.categoryId = kindDefaultCat(st.kind);
     drawTxSheet(e);
   },
+  'tx-savedir': (el) => { const e = topSheet(); syncTxFields(e); e.data.tx.st.saveOut = el.dataset.v === 'out'; drawTxSheet(e); },
   'tx-pickcat': () => {
     const e = topSheet(); syncTxFields(e);
     const { f, st } = e.data.tx;
     pickCategory({
       current: f.categoryId, kinds: [st.kind, ...KIND_ORDER.filter((k) => k !== st.kind)],
-      onPick: (id) => { f.categoryId = id; st.kind = kindOf(id); st.catChanged = true; drawTxSheet(e); }
+      onPick: (id) => { f.categoryId = id; if (kindOf(id) !== st.kind) resetDirection(e, kindOf(id)); st.kind = kindOf(id); st.catChanged = true; drawTxSheet(e); }
     });
   },
   'tx-save': () => saveTxSheet(),
@@ -3745,6 +3826,12 @@ const ACTIONS = {
   'pick-newcat': (el) => sheetCategoryEdit(null, { kind: el.dataset.kind, onSaved: (c) => finishPick(c.id) }),
   'pick-newgoal': () => { const ge = sheetGoalEdit(null); ge.data.onSaved = (gid) => finishPick('goal:' + gid); },
   'open-repeats': () => sheetRepeats(),
+  'repeat-ahead': (el) => {
+    S.settings.repeatAhead = +el.dataset.v;
+    S.recurring.forEach(rematerialize); runRecurring();
+    persist(); render(); refreshSheets();
+    toast(+el.dataset.v ? `Repeating payments are filled in ${el.dataset.v} months ahead` : 'Repeating payments are added on the day they\'re due');
+  },
   'open-groups': () => sheetGroups(),
   'group-drill': (el) => sheetGroupDrill(el.dataset.id, el.dataset.start, el.dataset.end),
   'cat-move': (el) => sheetCatMove(el.dataset.id),
@@ -3783,7 +3870,8 @@ const ACTIONS = {
   'rec-save': () => saveRepeat(),
   'rec-delete': async () => {
     const e = topSheet(); const r = S.recurring.find((x) => x.id === e.data.rp.id); if (!r) return;
-    if (!(await confirmSheet({ title: `Stop repeating ${esc(r.name)}?`, message: 'Nothing new will be added. Entries already added stay in your history.', confirm: 'Stop repeating', danger: true }))) return;
+    if (!(await confirmSheet({ title: `Stop repeating ${esc(r.name)}?`, message: 'Its scheduled future copies are removed. Ones already past stay in your history.', confirm: 'Stop repeating', danger: true }))) return;
+    removeFutureCopies([r.id]);
     S.recurring = S.recurring.filter((x) => x !== r);
     persist(); closeSheet(); render(); refreshSheets(); toast('Repeating payment stopped');
   },
@@ -3865,6 +3953,7 @@ const ACTIONS = {
     S.transactions.forEach((t) => { if (t.goalId === g.id) t.goalId = ''; if (t.categoryId === 'goal:' + g.id) t.categoryId = 'savingsxfer'; });
     S.rules = S.rules.filter((r) => r.categoryId !== 'goal:' + g.id);
     delete S.groupMap['goal:' + g.id];
+    removeFutureCopies(S.recurring.filter((r) => r.categoryId === 'goal:' + g.id).map((r) => r.id));
     S.recurring = S.recurring.filter((r) => r.categoryId !== 'goal:' + g.id);
     persist(); closeAllSheets(); render(); toast('Goal deleted');
   },
@@ -3887,11 +3976,11 @@ const ACTIONS = {
     if (repBox && repBox.checked) {
       const day = clamp(+$('#gm-day', e.el).value || 1, 1, 31);
       const r = { id: uid('rp'), goalId: mode === 'add' ? id : undefined, name, matchKey: tx.merchantKey, amount: tx.amount, categoryId: 'goal:' + id, accountId: tx.accountId, notes: '', day,
-        startDate: date, endDate: '', lastDate: date, nextDate: occurrence(nextYm(ymOf(date)), day), paused: false, createdAt: Date.now() };
+        startDate: date, endDate: '', lastDate: date, nextDate: occurrence(nextYm(ymOf(date)), day), paused: false, anchorMonth: ymOf(date), skips: [], createdAt: Date.now() };
       S.recurring.push(r); tx.recurringId = r.id;
       if (mode === 'add' && !(g.monthly > 0)) g.monthly = round2(v);
       const n = runRecurring();
-      repMsg = n ? `. Repeats monthly; ${n} earlier month${n === 1 ? '' : 's'} added too` : `. Repeats monthly, next on ${fmtDate(r.nextDate)}`;
+      repMsg = n ? `. Repeats monthly; ${n} earlier month${n === 1 ? '' : 's'} added too` : `. Repeats monthly${nextDue(r) ? `, next on ${fmtDate(nextDue(r))}` : ''}`;
     }
     persist(); closeSheet(); render(); refreshSheets();
     toast((mode === 'add' ? `Added ${money(v)} to ${g.name}` : `Took ${money(v)} out of ${g.name}`) + repMsg);
@@ -4000,6 +4089,7 @@ const ACTIONS = {
 };
 
 const CHANGES = {
+  'tx-fromgoal': () => { const e = topSheet(); if (!e || !e.data.tx) return; syncTxFields(e); const { f, st } = e.data.tx; if (st.fromGoal && !f.goalId) { const g = S.goals.find((x) => !x.archived); f.goalId = g ? g.id : ''; } drawTxSheet(e); },
   'gm-rep': (el) => { const o = $('#gm-rep-opts', topSheet().el); if (o) o.style.display = el.checked ? '' : 'none'; },
   'tx-rep': () => { const e = topSheet(); if (e && e.data.tx) { syncTxFields(e); const { f, st } = e.data.tx; if (!st.rep.dayTouched) st.rep.day = +String(f.date).slice(8, 10) || 1; drawTxSheet(e); } },
   'tx-date': () => { const e = topSheet(); if (e && e.data.tx) { syncTxFields(e); const { f, st } = e.data.tx; if (st.rep.on && !st.rep.dayTouched) { st.rep.day = +String(f.date).slice(8, 10) || 1; drawTxSheet(e); } } },
@@ -4025,6 +4115,7 @@ const CHANGES = {
 };
 let searchTimer = null;
 const INPUTS = {
+  'tx-abs': (el) => { const e = topSheet(); if (!e || !e.data.tx) return; e.data.tx.st.abs = el.value; const p = $('#tx-goal-preview', e.el); if (p) p.innerHTML = savingsPreview(e); },
   'tx-q': (el) => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { UI.tx.q = el.value; UI.tx.limit = 150; const box = $('#tx-results'); if (box) box.innerHTML = txResults(); }, 140); },
   'cat-search': (el) => {
     const q = el.value.trim().toLowerCase();

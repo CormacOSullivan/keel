@@ -1,5 +1,5 @@
 // Keel offline cache. Everything the app needs is stored on the device after the first visit.
-const CACHE = 'keel-eee52e51';
+const CACHE = 'keel-1a44a687';
 const FILES = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES.map((f) => new Request(f, { cache: 'reload' })))).then(() => self.skipWaiting()));
